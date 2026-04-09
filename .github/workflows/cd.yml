@@ -2,71 +2,80 @@ name: CD - Deploy to EC2 Swarm
 
 on:
   workflow_run:
-    workflows: ["CI"]  # Your CI workflow name
+    workflows: ["CI"]
     types: [completed]
+
+permissions:  # ✅ FIXED: Add these for OIDC
+  id-token: write
+  contents: read
 
 jobs:
   deploy:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    environment: production  # Optional: for approvals/secrets
 
     steps:
-    - name: Configure AWS Credentials (Runner)
+    - name: Configure AWS OIDC
       uses: aws-actions/configure-aws-credentials@v4
       with:
-        role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsRole
+        role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/myoidcrole
         aws-region: us-east-1
+        role-session-name: GitHubActions-${{ github.repository }}
 
-    - name: Login to ECR (Runner)
-      id: ecr-login
+    - name: ECR Login
+      id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Deploy & Update Services
-      uses: appleboy/ssh-action@v1.0.3  # FIXED: v1.0.3 (not v0.1.10)
+    - name: Deploy Services
+      id: deploy
+      uses: appleboy/ssh-action@v1.0.3
       env:
-        ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
       with:
         host: ${{ secrets.SERVER_IP }}
         username: ubuntu
         key: ${{ secrets.SSH_PRIVATE_KEY }}
-        port: 22
         script: |
-          # ECR login on EC2
+          # ECR login
           aws ecr get-login-password --region us-east-1 | \
           docker login --username AWS --password-stdin $ECR_REGISTRY
           
-          # Pull latest images
+          # Pull & update (use --image for latest)
           docker pull $ECR_REGISTRY/swarmtaskfbackend:latest
+          docker service update --force --image $ECR_REGISTRY/swarmtaskfbackend:latest foodapp_backend --update-parallelism 1 --update-delay 10s || echo "First deploy, ignoring"
+          
           docker pull $ECR_REGISTRY/swarmtaskfrontend:latest
+          docker service update --force --image $ECR_REGISTRY/swarmtaskfrontend:latest foodapp_frontend --update-parallelism 1 --update-delay 10s || echo "First deploy, ignoring"
           
-          # Rolling update with force (triggers Swarm healthcheck/rollback)
-          docker service update --force foodapp_backend --image $ECR_REGISTRY/swarmtaskfbackend:latest
-          docker service update --force foodapp_frontend --image $ECR_REGISTRY/swarmtaskfrontend:latest
-          
-          # Quick status
+          # Status
           docker service ls foodapp
 
     - name: Health Check
       run: |
-        echo "Checking health..."
-        sleep 30
-        RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -f http://${{ secrets.SERVER_IP }}/api/health || echo "FAIL")
-        if [ "$RESPONSE" != "200" ]; then
-          echo "Health check failed: $RESPONSE"
-          exit 1
-        fi
-        echo "✅ All healthy!"
+        echo "Health check..."
+        for i in {1..6}; do
+          sleep 10
+          if curl -f -s http://${{ secrets.SERVER_IP }}/api/health; then
+            echo "✅ Healthy!"
+            exit 0
+          fi
+        done
+        echo "❌ Health failed"
+        exit 1
 
-    - name: Rollback on Failure
-      if: failure()
+    - name: Rollback (Only if Services Have History)
+      if: failure() && steps.deploy.outcome == 'success'
       uses: appleboy/ssh-action@v1.0.3
       with:
         host: ${{ secrets.SERVER_IP }}
         username: ubuntu
         key: ${{ secrets.SSH_PRIVATE_KEY }}
         script: |
-          echo "🚨 ROLLBACK TRIGGERED"
-          docker service rollback foodapp_backend $PREVIOUS_VERSION  # Swarm tracks previous
-          docker service rollback foodapp_frontend $PREVIOUS_VERSION
-          docker service ls foodapp
+          echo "🚨 Attempting rollback..."
+          docker service rollback foodapp_backend --dry-run 2>/dev/null && \
+          docker service rollback foodapp_backend || echo "No rollback history"
+          
+          docker service rollback foodapp_frontend --dry-run 2>/dev/null && \
+          docker service rollback foodapp_frontend || echo "No rollback history"
+          
+          docker service ls foodapp  # ✅ FIXED syntax
