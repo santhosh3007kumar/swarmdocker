@@ -5,7 +5,7 @@ on:
     workflows: ["CI"]
     types: [completed]
 
-permissions:  # ✅ FIXED: Add these for OIDC
+permissions:
   id-token: write
   contents: read
 
@@ -15,19 +15,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Configure AWS OIDC
+    - name: Configure AWS OIDC  # ✅ FIXED session name
       uses: aws-actions/configure-aws-credentials@v4
       with:
         role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/myoidcrole
         aws-region: us-east-1
-        role-session-name: GitHubActions-${{ github.repository }}
+        role-session-name: GitHubActions-swarmdocker  # ✅ No slashes!
 
     - name: ECR Login
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
     - name: Deploy Services
-      id: deploy
       uses: appleboy/ssh-action@v1.0.3
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -36,46 +35,40 @@ jobs:
         username: ubuntu
         key: ${{ secrets.SSH_PRIVATE_KEY }}
         script: |
-          # ECR login
           aws ecr get-login-password --region us-east-1 | \
           docker login --username AWS --password-stdin $ECR_REGISTRY
           
-          # Pull & update (use --image for latest)
           docker pull $ECR_REGISTRY/swarmtaskfbackend:latest
-          docker service update --force --image $ECR_REGISTRY/swarmtaskfbackend:latest foodapp_backend --update-parallelism 1 --update-delay 10s || echo "First deploy, ignoring"
+          docker service update --force --image $ECR_REGISTRY/swarmtaskfbackend:latest foodapp_backend
           
-          docker pull $ECR_REGISTRY/swarmtaskfrontend:latest
-          docker service update --force --image $ECR_REGISTRY/swarmtaskfrontend:latest foodapp_frontend --update-parallelism 1 --update-delay 10s || echo "First deploy, ignoring"
+          docker pull $ECR_REGISTRY/swarmtaskfrontend:latest  
+          docker service update --force --image $ECR_REGISTRY/swarmtaskfrontend:latest foodapp_frontend
           
-          # Status
+          sleep 10
           docker service ls foodapp
 
     - name: Health Check
       run: |
-        echo "Health check..."
-        for i in {1..6}; do
-          sleep 10
-          if curl -f -s http://${{ secrets.SERVER_IP }}/api/health; then
+        for i in {1..12}; do
+          sleep 5
+          if curl -f -s http://${{ secrets.SERVER_IP }}/api/health > /dev/null; then
             echo "✅ Healthy!"
             exit 0
           fi
+          echo "Attempt $i/12..."
         done
-        echo "❌ Health failed"
+        echo "❌ Health check failed"
         exit 1
 
-    - name: Rollback (Only if Services Have History)
-      if: failure() && steps.deploy.outcome == 'success'
+    - name: Rollback on Failure  # ✅ FIXED rollback logic
+      if: failure()
       uses: appleboy/ssh-action@v1.0.3
       with:
         host: ${{ secrets.SERVER_IP }}
         username: ubuntu
         key: ${{ secrets.SSH_PRIVATE_KEY }}
         script: |
-          echo "🚨 Attempting rollback..."
-          docker service rollback foodapp_backend --dry-run 2>/dev/null && \
-          docker service rollback foodapp_backend || echo "No rollback history"
-          
-          docker service rollback foodapp_frontend --dry-run 2>/dev/null && \
-          docker service rollback foodapp_frontend || echo "No rollback history"
-          
-          docker service ls foodapp  # ✅ FIXED syntax
+          echo "🚨 Rolling back..."
+          docker service rollback foodapp_backend 2>/dev/null || echo "No previous version"
+          docker service rollback foodapp_frontend 2>/dev/null || echo "No previous version"
+          docker service ls foodapp
