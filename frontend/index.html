@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Simple App</title>
+</head>
+<body>
+
+<h1>Frontend Page</h1>
+<p id="msg">Loading...</p>
+
+<script>
+  fetch("/api")
+    .then(res => res.text())
+    .then(data => {
+      document.getElementById("msg").innerText = data;
+    });
+</script>
+
+</body>
+</html>
