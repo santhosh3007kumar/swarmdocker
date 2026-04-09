@@ -1,47 +1,72 @@
-name: CD
+name: CD - Deploy to EC2 Swarm
 
 on:
   workflow_run:
-    workflows: ["CI"]
+    workflows: ["CI"]  # Your CI workflow name
     types: [completed]
 
 jobs:
   deploy:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    environment: production  # Optional: for approvals/secrets
 
     steps:
-    #  Connect to EC2 & deploy
-    - name: Deploy to EC2 (Swarm)
-      uses: appleboy/ssh-action@v0.1.10
+    - name: Configure AWS Credentials (Runner)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsRole
+        aws-region: us-east-1
+
+    - name: Login to ECR (Runner)
+      id: ecr-login
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Deploy & Update Services
+      uses: appleboy/ssh-action@v1.0.3  # FIXED: v1.0.3 (not v0.1.10)
+      env:
+        ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
       with:
         host: ${{ secrets.SERVER_IP }}
         username: ubuntu
         key: ${{ secrets.SSH_PRIVATE_KEY }}
+        port: 22
         script: |
-          aws ecr get-login-password --region us-east-1 \
-          | docker login --username AWS --password-stdin \
-          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+          # ECR login on EC2
+          aws ecr get-login-password --region us-east-1 | \
+          docker login --username AWS --password-stdin $ECR_REGISTRY
+          
+          # Pull latest images
+          docker pull $ECR_REGISTRY/swarmtaskfbackend:latest
+          docker pull $ECR_REGISTRY/swarmtaskfrontend:latest
+          
+          # Rolling update with force (triggers Swarm healthcheck/rollback)
+          docker service update --force foodapp_backend --image $ECR_REGISTRY/swarmtaskfbackend:latest
+          docker service update --force foodapp_frontend --image $ECR_REGISTRY/swarmtaskfrontend:latest
+          
+          # Quick status
+          docker service ls foodapp
 
-          docker service update --force foodapp_backend
-          docker service update --force foodapp_frontend
-
-    # Health Check
     - name: Health Check
       run: |
-        echo "Checking application health..."
-        sleep 20
-        curl -f http://${{ secrets.SERVER_IP }}/api || exit 1
+        echo "Checking health..."
+        sleep 30
+        RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -f http://${{ secrets.SERVER_IP }}/api/health || echo "FAIL")
+        if [ "$RESPONSE" != "200" ]; then
+          echo "Health check failed: $RESPONSE"
+          exit 1
+        fi
+        echo "✅ All healthy!"
 
-    #  Rollback if failed
-    - name: Rollback if Failed
+    - name: Rollback on Failure
       if: failure()
-      uses: appleboy/ssh-action@v0.1.10
+      uses: appleboy/ssh-action@v1.0.3
       with:
         host: ${{ secrets.SERVER_IP }}
         username: ubuntu
         key: ${{ secrets.SSH_PRIVATE_KEY }}
         script: |
-          echo "Rollback triggered..."
-          docker service rollback foodapp_backend
-          docker service rollback foodapp_frontend
+          echo "🚨 ROLLBACK TRIGGERED"
+          docker service rollback foodapp_backend $PREVIOUS_VERSION  # Swarm tracks previous
+          docker service rollback foodapp_frontend $PREVIOUS_VERSION
+          docker service ls foodapp
