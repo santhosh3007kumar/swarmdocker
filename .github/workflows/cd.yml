@@ -26,7 +26,7 @@ jobs:
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Deploy Services on EC2
+    - name: Deploy Stack on EC2
       uses: appleboy/ssh-action@v1.0.3
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -35,46 +35,55 @@ jobs:
         username: ubuntu
         key: ${{ secrets.SSH_PRIVATE_KEY }}
         script: |
+          cd ~/swarmdocker || exit 1
+
           # Clone repo if not exists, else pull latest
-          if [ -d ~/swarmdocker/.git ]; then
-            cd ~/swarmdocker
+          if [ -d .git ]; then
             git reset --hard
             git pull origin main
           else
-            git clone https://github.com/santhosh3007kumar/swarmdocker.git ~/swarmdocker
-            cd ~/swarmdocker
+            git clone https://github.com/santhosh3007kumar/swarmdocker.git .
           fi
 
           # Login to ECR
           aws ecr get-login-password --region us-east-1 | \
           docker login --username AWS --password-stdin $ECR_REGISTRY
 
-          # Pull images
+          # Backup current stack images
+          echo "Saving current stack images for rollback..."
+          CURRENT_BACKEND=$(docker service inspect --format='{{.Spec.TaskTemplate.ContainerSpec.Image}}' foodapp_foodapp_backend)
+          CURRENT_FRONTEND=$(docker service inspect --format='{{.Spec.TaskTemplate.ContainerSpec.Image}}' foodapp_foodapp_frontend)
+          echo "Backend: $CURRENT_BACKEND"
+          echo "Frontend: $CURRENT_FRONTEND"
+
+          # Pull new images
           docker pull $ECR_REGISTRY/swarmtaskfbackend:latest
           docker pull $ECR_REGISTRY/swarmtaskfrontend:latest
 
-          # Deploy Docker Swarm stack
+          # Deploy new stack
           docker stack deploy -c docker-compose.yml foodapp
 
-          # Force update services with latest images
-          docker service update --force --image $ECR_REGISTRY/swarmtaskfbackend:latest foodapp_backend
-          docker service update --force --image $ECR_REGISTRY/swarmtaskfrontend:latest foodapp_frontend
-
-          sleep 10
-          docker service ls foodapp
+          # Wait for services to start
+          sleep 15
+          docker service ls
 
     - name: Health Check
-      run: |
-        for i in {1..12}; do
-          sleep 5
-          if curl -f -s http://${{ secrets.SERVER_IP }}/api/health > /dev/null; then
-            echo "✅ Healthy!"
-            exit 0
-          fi
-          echo "Attempt $i/12..."
-        done
-        echo "❌ Health check failed"
-        exit 1
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.SERVER_IP }}
+        username: ubuntu
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        script: |
+          for i in {1..12}; do
+            sleep 5
+            if curl -f -s http://${{ secrets.SERVER_IP }}/api/health > /dev/null; then
+              echo "✅ Healthy!"
+              exit 0
+            fi
+            echo "Attempt $i/12..."
+          done
+          echo "❌ Health check failed"
+          exit 1
 
     - name: Rollback on Failure
       if: failure()
@@ -84,7 +93,9 @@ jobs:
         username: ubuntu
         key: ${{ secrets.SSH_PRIVATE_KEY }}
         script: |
-          echo "🚨 Rolling back..."
-          docker service rollback foodapp_backend 2>/dev/null || echo "No previous version"
-          docker service rollback foodapp_frontend 2>/dev/null || echo "No previous version"
-          docker service ls foodapp
+          echo "🚨 Health check failed. Rolling back..."
+          # Redeploy previous images
+          docker service update --force --image $CURRENT_BACKEND foodapp_foodapp_backend
+          docker service update --force --image $CURRENT_FRONTEND foodapp_foodapp_frontend
+          sleep 10
+          docker service ls
