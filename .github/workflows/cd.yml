@@ -15,18 +15,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Configure AWS OIDC  # ✅ FIXED session name
+    - name: Configure AWS OIDC
       uses: aws-actions/configure-aws-credentials@v4
       with:
         role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/myoidcrole
         aws-region: us-east-1
-        role-session-name: GitHubActions-swarmdocker  # ✅ No slashes!
+        role-session-name: GitHubActions-swarmdocker
 
     - name: ECR Login
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Deploy Services
+    - name: Deploy Services on EC2
       uses: appleboy/ssh-action@v1.0.3
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -35,15 +35,31 @@ jobs:
         username: ubuntu
         key: ${{ secrets.SSH_PRIVATE_KEY }}
         script: |
+          # Clone repo if not exists, else pull latest
+          if [ -d ~/swarmdocker/.git ]; then
+            cd ~/swarmdocker
+            git reset --hard
+            git pull origin main
+          else
+            git clone https://github.com/santhosh3007kumar/swarmdocker.git ~/swarmdocker
+            cd ~/swarmdocker
+          fi
+
+          # Login to ECR
           aws ecr get-login-password --region us-east-1 | \
           docker login --username AWS --password-stdin $ECR_REGISTRY
-          
+
+          # Pull images
           docker pull $ECR_REGISTRY/swarmtaskfbackend:latest
+          docker pull $ECR_REGISTRY/swarmtaskfrontend:latest
+
+          # Deploy Docker Swarm stack
+          docker stack deploy -c docker-compose.yml foodapp
+
+          # Force update services with latest images
           docker service update --force --image $ECR_REGISTRY/swarmtaskfbackend:latest foodapp_backend
-          
-          docker pull $ECR_REGISTRY/swarmtaskfrontend:latest  
           docker service update --force --image $ECR_REGISTRY/swarmtaskfrontend:latest foodapp_frontend
-          
+
           sleep 10
           docker service ls foodapp
 
@@ -60,7 +76,7 @@ jobs:
         echo "❌ Health check failed"
         exit 1
 
-    - name: Rollback on Failure  # ✅ FIXED rollback logic
+    - name: Rollback on Failure
       if: failure()
       uses: appleboy/ssh-action@v1.0.3
       with:
