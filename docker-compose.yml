@@ -1,24 +1,25 @@
 version: '3.8'
 services:
-  backend:
+  foodapp_backend:
     image: 352311919031.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfbackend:latest
     expose:
       - "4000"
     networks:
       - appnet
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health"] || exit 1
       interval: 30s
       retries: 3
+      timeout: 10s
 
-  frontend:
+  foodapp_frontend:
     image: 352311919031.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfrontend:latest
     expose:
       - "80"
     networks:
       - appnet
 
-  nginx:
+  foodapp_nginx:
     image: nginx:alpine
     ports:
       - "80:80"
@@ -27,9 +28,10 @@ services:
     networks:
       - appnet
     depends_on:
-      - backend
-      - frontend
+      - foodapp_backend
+      - foodapp_frontend
 
 networks:
   appnet:
     driver: overlay
+    attachable: true
