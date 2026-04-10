@@ -33,13 +33,13 @@ jobs:
       run: |
         docker build -t backend:latest ./backend
         docker tag backend:latest \
-        ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfbackend:latest
-        docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfbackend:latest
+        ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfbackend:v1
+        docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfbackend:v1
 
     #  Frontend Build & Push
     - name: Build & Push Frontend
       run: |
         docker build -t frontend:latest ./frontend
         docker tag frontend:latest \
-        ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfrontend:latest
-        docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfrontend:latest
+        ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfrontend:v1
+        docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfrontend:v1
