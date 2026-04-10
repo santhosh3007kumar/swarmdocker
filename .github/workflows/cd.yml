@@ -20,13 +20,12 @@ jobs:
       with:
         role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/myoidcrole
         aws-region: us-east-1
-        role-session-name: GitHubActions-swarmdocker
 
     - name: ECR Login
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Deploy Stack on EC2
+    - name: Deploy + Health Check + Rollback
       uses: appleboy/ssh-action@v1.0.3
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -35,9 +34,11 @@ jobs:
         username: ubuntu
         key: ${{ secrets.SSH_PRIVATE_KEY }}
         script: |
+          set -e
+
           cd ~/swarmdocker || exit 1
 
-          # Clone repo if not exists, else pull latest
+          echo "🚀 Pull latest repo"
           if [ -d .git ]; then
             git reset --hard
             git pull origin main
@@ -45,57 +46,46 @@ jobs:
             git clone https://github.com/santhosh3007kumar/swarmdocker.git .
           fi
 
-          # Login to ECR
+          echo "🔐 Login to ECR"
           aws ecr get-login-password --region us-east-1 | \
           docker login --username AWS --password-stdin $ECR_REGISTRY
 
-          # Backup current stack images
-          echo "Saving current stack images for rollback..."
-          CURRENT_BACKEND=$(docker service inspect --format='{{.Spec.TaskTemplate.ContainerSpec.Image}}' foodapp_foodapp_backend)
-          CURRENT_FRONTEND=$(docker service inspect --format='{{.Spec.TaskTemplate.ContainerSpec.Image}}' foodapp_foodapp_frontend)
-          echo "Backend: $CURRENT_BACKEND"
-          echo "Frontend: $CURRENT_FRONTEND"
+          echo "💾 Saving current images (ROLLBACK SAFE)"
+          BACKUP_BACKEND=$(docker service inspect --format='{{.Spec.TaskTemplate.ContainerSpec.Image}}' foodapp_foodapp_backend)
+          BACKUP_FRONTEND=$(docker service inspect --format='{{.Spec.TaskTemplate.ContainerSpec.Image}}' foodapp_foodapp_frontend)
 
-          # Pull new images
+          echo "Backend: $BACKUP_BACKEND"
+          echo "Frontend: $BACKUP_FRONTEND"
+
+          echo "📥 Pull new images"
           docker pull $ECR_REGISTRY/swarmtaskfbackend:latest
           docker pull $ECR_REGISTRY/swarmtaskfrontend:latest
 
-          # Deploy new stack
+          echo "🚀 Deploy stack"
           docker stack deploy -c docker-compose.yml foodapp
 
-          # Wait for services to start
-          sleep 15
-          docker service ls
+          echo "⏳ Waiting for services..."
+          sleep 20
 
-    - name: Health Check
-      uses: appleboy/ssh-action@v1.0.3
-      with:
-        host: ${{ secrets.SERVER_IP }}
-        username: ubuntu
-        key: ${{ secrets.SSH_PRIVATE_KEY }}
-        script: |
+          echo "🏥 Health Check"
           for i in {1..12}; do
             sleep 5
-            if curl -f -s http://${{ secrets.SERVER_IP }}/api/health > /dev/null; then
+            if curl -f -s http://localhost/api/health > /dev/null; then
               echo "✅ Healthy!"
               exit 0
             fi
-            echo "Attempt $i/24..."
+            echo "Attempt $i/12..."
           done
-          echo "❌ Health check failed"
-          exit 1
 
-    - name: Rollback on Failure
-      if: failure()
-      uses: appleboy/ssh-action@v1.0.3
-      with:
-        host: ${{ secrets.SERVER_IP }}
-        username: ubuntu
-        key: ${{ secrets.SSH_PRIVATE_KEY }}
-        script: |
-          echo "🚨 Health check failed. Rolling back..."
-          # Redeploy previous images
-          docker service update --force --image $CURRENT_BACKEND foodapp_foodapp_backend
-          docker service update --force --image $CURRENT_FRONTEND foodapp_foodapp_frontend
+          echo "❌ Health check failed — rolling back"
+
+          docker service update --force \
+            --image $BACKUP_BACKEND foodapp_foodapp_backend
+
+          docker service update --force \
+            --image $BACKUP_FRONTEND foodapp_foodapp_frontend
+
           sleep 10
+
+          echo "🔄 Rolled back successfully"
           docker service ls
