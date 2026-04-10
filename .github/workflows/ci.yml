@@ -28,18 +28,36 @@ jobs:
         | docker login --username AWS --password-stdin \
         ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
 
-    #  Backend Build & Push
+    # Backend Build & Push
     - name: Build & Push Backend
       run: |
         docker build -t backend:latest ./backend
-        docker tag backend:latest \
-        ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfbackend:v1
-        docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfbackend:v1
 
-    #  Frontend Build & Push
+        # push with commit SHA — CD uses this to pull exact version
+        docker tag backend:latest \
+          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfbackend:${{ github.sha }}
+        docker push \
+          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfbackend:${{ github.sha }}
+
+        # also push :latest for convenience
+        docker tag backend:latest \
+          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfbackend:latest
+        docker push \
+          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfbackend:latest
+
+    # Frontend Build & Push
     - name: Build & Push Frontend
       run: |
         docker build -t frontend:latest ./frontend
+
+        # push with commit SHA — CD uses this to pull exact version
         docker tag frontend:latest \
-        ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfrontend:v1
-        docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfrontend:v1
+          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfrontend:${{ github.sha }}
+        docker push \
+          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfrontend:${{ github.sha }}
+
+        # also push :latest for convenience
+        docker tag frontend:latest \
+          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfrontend:latest
+        docker push \
+          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfrontend:latest
