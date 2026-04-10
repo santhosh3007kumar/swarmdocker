@@ -58,8 +58,9 @@ jobs:
 
           echo "📥 Updating repo"
           if [ -d .git ]; then
+            git fetch --all
             git reset --hard
-            git pull origin main
+            git clean -fd
           else
             git clone https://github.com/santhosh3007kumar/swarmdocker.git .
           fi
