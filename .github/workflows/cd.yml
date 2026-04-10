@@ -80,7 +80,7 @@ jobs:
               echo "✅ Healthy!"
               exit 0
             fi
-            echo "Attempt $i/12..."
+            echo "Attempt $i/24..."
           done
           echo "❌ Health check failed"
           exit 1
