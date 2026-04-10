@@ -3,7 +3,7 @@ version: "3.8"
 services:
 
   foodapp_backend:
-    image: 352311919031.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfbackend:v1
+    image: 352311919031.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfbackend:${IMAGE_TAG:-latest}
     networks:
       - appnet
     deploy:
@@ -15,9 +15,12 @@ services:
         delay: 5s
         order: start-first
         failure_action: rollback
+        monitor: 30s
       rollback_config:
         parallelism: 1
-        order: stop-first
+        delay: 5s
+        order: start-first
+        failure_action: pause
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:4000/health || exit 1"]
       interval: 30s
@@ -26,7 +29,8 @@ services:
       start_period: 20s
 
   foodapp_frontend:
-    image: 352311919031.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfbackend:v1
+    # BUG 1 FIXED: was swarmtaskfbackend — changed to swarmtaskfrontend
+    image: 352311919031.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfrontend:${IMAGE_TAG:-latest}
     networks:
       - appnet
     deploy:
@@ -38,9 +42,18 @@ services:
         delay: 5s
         order: start-first
         failure_action: rollback
+        monitor: 20s
       rollback_config:
         parallelism: 1
-        order: stop-first
+        delay: 5s
+        order: start-first
+        failure_action: pause
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:80 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
   foodapp_nginx:
     image: nginx:alpine
@@ -60,9 +73,12 @@ services:
         delay: 5s
         order: start-first
         failure_action: rollback
+        monitor: 15s
       rollback_config:
         parallelism: 1
-        order: stop-first
+        delay: 5s
+        order: start-first
+        failure_action: pause
 
 networks:
   appnet:
@@ -71,4 +87,5 @@ networks:
 
 configs:
   nginx_conf:
+    # BUG 4 FIXED: nginx.conf is a separate file — not pasted inside this file
     file: ./nginx.conf

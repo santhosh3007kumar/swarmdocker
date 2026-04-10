@@ -15,6 +15,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
     # ----------------------------
     # AWS OIDC LOGIN
     # ----------------------------
@@ -41,96 +42,167 @@ jobs:
         username: ubuntu
         key: ${{ secrets.SSH_PRIVATE_KEY }}
 
-        # pass registry correctly
-        envs: ECR_REGISTRY
-
         script: |
           set -e
 
-          # IMPORTANT: define registry properly (REQUIRED FIX)
           ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          IMAGE_TAG="${{ github.event.workflow_run.head_sha }}"
+          STACK="foodapp"
 
           echo "=============================="
-          echo "🚀 STARTING SWARM DEPLOY"
+          echo "STARTING SWARM DEPLOY"
+          echo "IMAGE_TAG : $IMAGE_TAG"
+          echo "ECR       : $ECR_REGISTRY"
           echo "=============================="
 
-          cd ~/swarmdocker || exit 1
+          # ----------------------------
+          # PULL LATEST REPO
+          # ----------------------------
+          cd ~/swarmdocker
+          git fetch --all
+          git reset --hard origin/main
+          git clean -fd
 
-          echo "📥 Updating repo"
-          if [ -d .git ]; then
-            git fetch --all
-            git reset --hard
-            git clean -fd
-          else
-            git clone https://github.com/santhosh3007kumar/swarmdocker.git .
-          fi
-
-          echo "🔐 ECR LOGIN"
+          # ----------------------------
+          # ECR LOGIN ON EC2
+          # ----------------------------
+          echo "ECR LOGIN"
           aws ecr get-login-password --region us-east-1 | \
-          docker login --username AWS --password-stdin $ECR_REGISTRY
+            docker login --username AWS --password-stdin $ECR_REGISTRY
 
-          echo "💾 BACKUP CURRENT IMAGES"
+          # ----------------------------
+          # PULL NEW IMAGES
+          # ----------------------------
+          echo "PULLING NEW IMAGES"
+          docker pull $ECR_REGISTRY/swarmtaskfbackend:$IMAGE_TAG
+          docker pull $ECR_REGISTRY/swarmtaskfrontend:$IMAGE_TAG
 
-          BACKUP_BACKEND=$(docker service inspect foodapp_backend \
-            --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' 2>/dev/null || true)
+          # ----------------------------
+          # DEPLOY STACK
+          # Swarm rolling update starts here
+          # update_config in docker-compose.yml controls this
+          # ----------------------------
+          echo "DEPLOYING STACK"
+          IMAGE_TAG=$IMAGE_TAG \
+            docker stack deploy \
+              -c docker-compose.yml \
+              $STACK \
+              --with-registry-auth
 
-          BACKUP_FRONTEND=$(docker service inspect foodapp_frontend \
-            --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' 2>/dev/null || true)
+          # ----------------------------
+          # WAIT FOR SERVICES TO CONVERGE
+          # Waits until running replicas == desired replicas
+          # ----------------------------
+          echo "WAITING FOR SERVICES TO CONVERGE"
 
-          echo "Backend Backup: $BACKUP_BACKEND"
-          echo "Frontend Backup: $BACKUP_FRONTEND"
+          wait_for_service() {
+            SERVICE=$1
+            TIMEOUT=120
+            ELAPSED=0
+            echo "Waiting for ${STACK}_${SERVICE}..."
+            while true; do
+              RUNNING=$(docker service ls \
+                --filter "name=${STACK}_${SERVICE}" \
+                --format "{{.Replicas}}" | cut -d'/' -f1)
+              DESIRED=$(docker service ls \
+                --filter "name=${STACK}_${SERVICE}" \
+                --format "{{.Replicas}}" | cut -d'/' -f2)
+              if [ "$RUNNING" = "$DESIRED" ] && [ -n "$RUNNING" ] && [ "$RUNNING" != "0" ]; then
+                echo "  ${SERVICE} converged ($RUNNING/$DESIRED) ✓"
+                break
+              fi
+              if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
+                echo "  TIMEOUT: ${SERVICE} did not converge ($RUNNING/$DESIRED)"
+                exit 1
+              fi
+              echo "  ${SERVICE}: $RUNNING/$DESIRED — waiting..."
+              sleep 5
+              ELAPSED=$((ELAPSED + 5))
+            done
+          }
 
-          echo "📦 PULL NEW IMAGES"
+          wait_for_service "foodapp_backend"
+          wait_for_service "foodapp_frontend"
+          wait_for_service "foodapp_nginx"
 
-          docker pull $ECR_REGISTRY/swarmtaskfbackend:v1
-          docker pull $ECR_REGISTRY/swarmtaskfrontend:v1
-
-          echo "🚀 DEPLOY STACK"
-
-          docker stack deploy -c docker-compose.yml foodapp
-
-          echo "⏳ WAIT FOR SERVICES TO START"
+          # Extra buffer — let app fully boot after converge
+          echo "All services converged — waiting 20s for full boot..."
           sleep 20
 
-          echo "🏥 HEALTH CHECK"
+          # ----------------------------
+          # HEALTH CHECK — backend + frontend
+          # 12 attempts x 10s = 2 minutes total
+          # ----------------------------
+          echo "RUNNING HEALTH CHECKS"
 
           SUCCESS=false
 
           for i in $(seq 1 12); do
-            sleep 5
+            BACKEND_OK=false
+            FRONTEND_OK=false
 
-            if curl -f -s http://127.0.0.1/api/health > /dev/null; then
-              echo "✅ Health check passed"
+            curl -f -s --max-time 5 http://127.0.0.1/api/health > /dev/null && BACKEND_OK=true
+            curl -f -s --max-time 5 http://127.0.0.1/           > /dev/null && FRONTEND_OK=true
+
+            echo "Attempt $i/12 — backend: $BACKEND_OK | frontend: $FRONTEND_OK"
+
+            if [ "$BACKEND_OK" = "true" ] && [ "$FRONTEND_OK" = "true" ]; then
+              echo "Health checks passed!"
               SUCCESS=true
               break
             fi
 
-            echo "Attempt $i/12 failed..."
+            sleep 10
           done
 
           # ----------------------------
-          # ROLLBACK IF FAILED
+          # ROLLBACK IF HEALTH CHECK FAILED
+          # docker service rollback uses rollback_config
+          # from docker-compose.yml automatically
           # ----------------------------
-          if [ "$SUCCESS" = false ]; then
-            echo "❌ Health check failed - rolling back"
+          if [ "$SUCCESS" = "false" ]; then
+            echo "=============================="
+            echo "HEALTH CHECK FAILED — ROLLING BACK"
+            echo "=============================="
 
-            if [ ! -z "$BACKUP_BACKEND" ]; then
-              docker service update --force \
-                --image $BACKUP_BACKEND foodapp_backend
-            fi
+            docker service rollback ${STACK}_foodapp_backend  || true
+            docker service rollback ${STACK}_foodapp_frontend || true
 
-            if [ ! -z "$BACKUP_FRONTEND" ]; then
-              docker service update --force \
-                --image $BACKUP_FRONTEND foodapp_frontend
-            fi
+            echo "Waiting 30s for rollback to complete..."
+            sleep 30
 
-            sleep 10
-
-            echo "🔄 Rollback completed"
+            echo "Post-rollback service state:"
             docker service ls
 
-            exit 1
+            # Verify previous version healthy after rollback
+            RB_BACKEND=false
+            RB_FRONTEND=false
+            curl -f -s --max-time 5 http://127.0.0.1/api/health > /dev/null && RB_BACKEND=true
+            curl -f -s --max-time 5 http://127.0.0.1/           > /dev/null && RB_FRONTEND=true
+
+            echo "=============================="
+            echo "ROLLBACK HEALTH RESULT"
+            echo "backend : $RB_BACKEND"
+            echo "frontend: $RB_FRONTEND"
+            echo "=============================="
+
+            if [ "$RB_BACKEND" = "false" ] || [ "$RB_FRONTEND" = "false" ]; then
+              echo "ROLLBACK ALSO FAILED — manual intervention needed!"
+              docker service ls
+              docker stack ps $STACK
+              exit 1
+            fi
+
+            echo "Rollback successful — previous version is live"
+            docker service ls
+            exit 1   # still fail the GH Action so you get notified
           fi
 
-          echo "🎉 DEPLOY SUCCESSFUL"
+          # ----------------------------
+          # SUCCESS
+          # ----------------------------
+          echo "=============================="
+          echo "DEPLOY SUCCESSFUL"
+          echo "IMAGE_TAG: $IMAGE_TAG"
+          echo "=============================="
           docker service ls
