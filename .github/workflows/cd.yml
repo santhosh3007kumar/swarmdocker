@@ -58,8 +58,8 @@ jobs:
           echo "Frontend: $BACKUP_FRONTEND"
 
           echo "📥 Pull new images"
-          docker pull $ECR_REGISTRY/swarmtaskfbackend:latest
-          docker pull $ECR_REGISTRY/swarmtaskfrontend:latest
+          docker pull $ECR_REGISTRY/swarmtaskfbackend:v1
+          docker pull $ECR_REGISTRY/swarmtaskfrontend:v1
 
           echo "🚀 Deploy stack"
           docker stack deploy -c docker-compose.yml foodapp
@@ -80,10 +80,10 @@ jobs:
           echo "❌ Health check failed — rolling back"
 
           docker service update --force \
-            --image $BACKUP_BACKEND foodapp_foodapp_backend
+            --image $BACKUP_BACKEND foodapp_backend
 
           docker service update --force \
-            --image $BACKUP_FRONTEND foodapp_foodapp_frontend
+            --image $BACKUP_FRONTEND foodapp_frontend
 
           sleep 10
 
