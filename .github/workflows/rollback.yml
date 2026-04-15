@@ -8,13 +8,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
-    - name: Configure AWS OIDC
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/myoidcrole
-        aws-region: us-east-1
-
+   
+   
     - name: Execute Rollback
       uses: appleboy/ssh-action@v1.0.3
       with:
@@ -25,7 +20,11 @@ jobs:
         script: |
           STACK="foodapp"
 
-          echo "ROLLBACK STARTED"
+          # Check version file
+          if [ ! -f /tmp/prev_version.txt ]; then
+            echo "ERROR: No previous version file found!"
+            exit 1
+          fi
 
           # 🔥 Read previous version file
           cat /tmp/prev_version.txt

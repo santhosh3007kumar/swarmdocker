@@ -44,7 +44,7 @@ jobs:
         key: ${{ secrets.SSH_PRIVATE_KEY }}
 
         script: |
-          set +e
+          set -euo pipefail
 
           ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
           IMAGE_TAG="${{ github.event.workflow_run.head_sha }}"
@@ -61,22 +61,34 @@ jobs:
           git clean -fd
 
           # ----------------------------
+          # SAVE PREVIOUS VERSION (IMPORTANT FIX)
+          # ----------------------------
+          echo "Saving previous running images..."
+
+          echo "backend $(docker service inspect foodapp_foodapp_backend --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')" > /tmp/prev_version.txt
+
+          echo "frontend $(docker service inspect foodapp_foodapp_frontend --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')" >> /tmp/prev_version.txt
+
+          echo "nginx $(docker service inspect foodapp_foodapp_nginx --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')" >> /tmp/prev_version.txt
+
+          cat /tmp/prev_version.txt
+
+          # ----------------------------
           # ECR LOGIN
           # ----------------------------
           aws ecr get-login-password --region us-east-1 | \
             docker login --username AWS --password-stdin $ECR_REGISTRY
 
-
-          docker service ls --format "{{.Name}} {{.Image}}" > /tmp/prev_version.txt
-
+          # ----------------------------
+          # PULL IMAGES
+          # ----------------------------
           docker pull $ECR_REGISTRY/swarmtaskfbackend:$IMAGE_TAG
           docker pull $ECR_REGISTRY/swarmtaskfrontend:$IMAGE_TAG
 
           # ----------------------------
-          # REMOVE OLD STACK SAFELY
+          # REMOVE OLD STACK
           # ----------------------------
           docker stack rm $STACK || true
-          echo "Waiting for stack removal..."
           sleep 25
 
           # ----------------------------
@@ -130,7 +142,6 @@ jobs:
           wait_for_service "foodapp_frontend"
           wait_for_service "foodapp_nginx"
 
-          echo "WAITING EXTRA STABILIZATION..."
           sleep 15
 
           # ----------------------------
@@ -155,12 +166,10 @@ jobs:
             sleep 10
           done
 
-
           echo "=============================="
           echo "DEPLOY STATUS: $SUCCESS"
           echo "=============================="
 
-          # IMPORTANT: control GitHub job status
           if [ "$SUCCESS" = "true" ]; then
             echo "HEALTH CHECK PASSED"
             exit 0
@@ -168,5 +177,3 @@ jobs:
             echo "HEALTH CHECK FAILED"
             exit 1
           fi
-
-          
