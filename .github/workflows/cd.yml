@@ -160,42 +160,39 @@ jobs:
 
             sleep 10
           done
+          
 
           echo "=============================="
-      echo "DEPLOYMENT COMPLETED"
-      echo "Health Status: $SUCCESS"
-      echo "Waiting for manual review decision..."
-      echo "=============================="
-  # ----------------------------
-  # APPROVAL STEP
-  # ----------------------------
+            echo "DEPLOYMENT COMPLETED"
+            echo "Health Status: $SUCCESS"
+            echo "Waiting for manual decision"
+            echo "=============================="
+
+            docker service ls
+
+  # ✅ APPROVAL JOB (SEPARATE)
   approval:
     needs: deploy
     runs-on: ubuntu-latest
     environment: production
 
     steps:
-      - name: Waiting for approval
-        run: echo "Approve = rollback | Reject = keep deployment"
+      - run: echo "Approve = rollback | Reject = keep deployment"
 
-  # ----------------------------
-  # MANUAL ROLLBACK
-  # ----------------------------
+  # ✅ ROLLBACK JOB
   rollback:
     needs: approval
     runs-on: ubuntu-latest
-
     if: ${{ github.event.deployment_status.state == 'approved' }}
 
     steps:
-
       - name: Configure AWS OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/myoidcrole
           aws-region: us-east-1
 
-      - name: Rollback application
+      - name: Rollback
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_IP }}
@@ -203,8 +200,6 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
 
           script: |
-            set -e
-
             STACK="foodapp"
 
             echo "ROLLBACK STARTED"
