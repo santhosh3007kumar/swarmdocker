@@ -183,8 +183,7 @@ jobs:
   rollback:
     needs: approval
     runs-on: ubuntu-latest
-    if: ${{ github.event.deployment_status.state == 'approved' }}
-
+    
     steps:
       - name: Configure AWS OIDC
         uses: aws-actions/configure-aws-credentials@v4
