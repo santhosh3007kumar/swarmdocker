@@ -4,6 +4,8 @@ services:
 
   foodapp_backend:
     image: 352311919031.dkr.ecr.us-east-1.amazonaws.com/swarmtaskfbackend:${IMAGE_TAG:-latest}
+    ports:
+    - "4000:4000"
     networks:
       - appnet
     deploy:
