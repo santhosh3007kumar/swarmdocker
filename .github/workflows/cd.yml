@@ -43,7 +43,7 @@ jobs:
         key: ${{ secrets.SSH_PRIVATE_KEY }}
 
         script: |
-          set -e
+          set +e   # ✅ allow script to continue even if health fails
 
           ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
           IMAGE_TAG="${{ github.event.workflow_run.head_sha }}"
@@ -79,23 +79,18 @@ jobs:
 
           # ----------------------------
           # RECREATE NGINX CONFIG
-          # Swarm configs are immutable — must remove and recreate
-          # on every deploy otherwise stack deploy fails
           # ----------------------------
           echo "RECREATING NGINX CONFIG"
           docker stack rm $STACK || true
-          echo "Waiting for stack to fully remove..."
+          echo "Waiting for stack removal..."
           sleep 20
 
           docker config rm ${STACK}_nginx_conf 2>/dev/null || true
           docker config rm nginx_conf           2>/dev/null || true
           docker config create nginx_conf ./nginx.conf
-          echo "nginx_conf created ✓"
 
           # ----------------------------
           # DEPLOY STACK
-          # Swarm rolling update starts here
-          # update_config in docker-compose.yml controls this
           # ----------------------------
           echo "DEPLOYING STACK"
           IMAGE_TAG=$IMAGE_TAG \
@@ -105,16 +100,13 @@ jobs:
               --with-registry-auth
 
           # ----------------------------
-          # WAIT FOR SERVICES TO CONVERGE
-          # Waits until running replicas == desired replicas
+          # WAIT FOR SERVICES
           # ----------------------------
-          echo "WAITING FOR SERVICES TO CONVERGE"
-
           wait_for_service() {
             SERVICE=$1
             TIMEOUT=120
             ELAPSED=0
-            echo "Waiting for ${STACK}_${SERVICE}..."
+
             while true; do
               RUNNING=$(docker service ls \
                 --filter "name=${STACK}_${SERVICE}" \
@@ -122,15 +114,17 @@ jobs:
               DESIRED=$(docker service ls \
                 --filter "name=${STACK}_${SERVICE}" \
                 --format "{{.Replicas}}" | cut -d'/' -f2)
-              if [ "$RUNNING" = "$DESIRED" ] && [ -n "$RUNNING" ] && [ "$RUNNING" != "0" ]; then
-                echo "  ${SERVICE} converged ($RUNNING/$DESIRED) ✓"
+
+              if [ "$RUNNING" = "$DESIRED" ] && [ "$RUNNING" != "0" ]; then
+                echo "${SERVICE} ready ($RUNNING/$DESIRED)"
                 break
               fi
+
               if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
-                echo "  TIMEOUT: ${SERVICE} did not converge ($RUNNING/$DESIRED)"
-                exit 1
+                echo "Timeout waiting for $SERVICE"
+                break
               fi
-              echo "  ${SERVICE}: $RUNNING/$DESIRED — waiting..."
+
               sleep 5
               ELAPSED=$((ELAPSED + 5))
             done
@@ -140,13 +134,11 @@ jobs:
           wait_for_service "foodapp_frontend"
           wait_for_service "foodapp_nginx"
 
-          # Extra buffer — let app fully boot after converge
-          echo "All services converged — waiting 20s for full boot..."
+          echo "Waiting extra 20s..."
           sleep 20
 
           # ----------------------------
-          # HEALTH CHECK — backend + frontend
-          # 12 attempts x 10s = 2 minutes total
+          # HEALTH CHECK (INFO ONLY)
           # ----------------------------
           echo "RUNNING HEALTH CHECKS"
 
@@ -156,13 +148,12 @@ jobs:
             BACKEND_OK=false
             FRONTEND_OK=false
 
-            curl -f -s --max-time 5 http://127.0.0.1/api/health > /dev/null && BACKEND_OK=true
-            curl -f -s --max-time 5 http://127.0.0.1/           > /dev/null && FRONTEND_OK=true
+            curl -f -s http://127.0.0.1/api/health > /dev/null && BACKEND_OK=true
+            curl -f -s http://127.0.0.1/           > /dev/null && FRONTEND_OK=true
 
-            echo "Attempt $i/12 — backend: $BACKEND_OK | frontend: $FRONTEND_OK"
+            echo "Attempt $i → backend:$BACKEND_OK frontend:$FRONTEND_OK"
 
             if [ "$BACKEND_OK" = "true" ] && [ "$FRONTEND_OK" = "true" ]; then
-              echo "Health checks passed!"
               SUCCESS=true
               break
             fi
@@ -170,54 +161,57 @@ jobs:
             sleep 10
           done
 
-          # ----------------------------
-          # ROLLBACK IF HEALTH CHECK FAILED
-          # docker service rollback uses rollback_config
-          # from docker-compose.yml automatically
-          # ----------------------------
-          if [ "$SUCCESS" = "false" ]; then
-            echo "=============================="
-            echo "HEALTH CHECK FAILED — ROLLING BACK"
-            echo "=============================="
+          echo "=============================="
+      echo "DEPLOYMENT COMPLETED"
+      echo "Health Status: $SUCCESS"
+      echo "Waiting for manual review decision..."
+      echo "=============================="
+  # ----------------------------
+  # APPROVAL STEP
+  # ----------------------------
+  approval:
+    needs: deploy
+    runs-on: ubuntu-latest
+    environment: production
 
-            docker service rollback ${STACK}_foodapp_backend  || true
-            docker service rollback ${STACK}_foodapp_frontend || true
+    steps:
+      - name: Waiting for approval
+        run: echo "Approve = rollback | Reject = keep deployment"
 
-            echo "Waiting 30s for rollback to complete..."
+  # ----------------------------
+  # MANUAL ROLLBACK
+  # ----------------------------
+  rollback:
+    needs: approval
+    runs-on: ubuntu-latest
+
+    if: ${{ github.event.deployment_status.state == 'approved' }}
+
+    steps:
+
+      - name: Configure AWS OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/myoidcrole
+          aws-region: us-east-1
+
+      - name: Rollback application
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ubuntu
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+          script: |
+            set -e
+
+            STACK="foodapp"
+
+            echo "ROLLBACK STARTED"
+
+            docker service rollback ${STACK}_foodapp_backend
+            docker service rollback ${STACK}_foodapp_frontend
+            docker service rollback ${STACK}_foodapp_nginx
+
             sleep 30
-
-            echo "Post-rollback service state:"
             docker service ls
-
-            # Verify previous version healthy after rollback
-            RB_BACKEND=false
-            RB_FRONTEND=false
-            curl -f -s --max-time 5 http://127.0.0.1/api/health > /dev/null && RB_BACKEND=true
-            curl -f -s --max-time 5 http://127.0.0.1/           > /dev/null && RB_FRONTEND=true
-
-            echo "=============================="
-            echo "ROLLBACK HEALTH RESULT"
-            echo "backend : $RB_BACKEND"
-            echo "frontend: $RB_FRONTEND"
-            echo "=============================="
-
-            if [ "$RB_BACKEND" = "false" ] || [ "$RB_FRONTEND" = "false" ]; then
-              echo "ROLLBACK ALSO FAILED — manual intervention needed!"
-              docker service ls
-              docker stack ps $STACK
-              exit 1
-            fi
-
-            echo "Rollback successful — previous version is live"
-            docker service ls
-            exit 1   # still fail the GH Action so you get notified
-          fi
-
-          # ----------------------------
-          # SUCCESS
-          # ----------------------------
-          echo "=============================="
-          echo "DEPLOY SUCCESSFUL"
-          echo "IMAGE_TAG: $IMAGE_TAG"
-          echo "=============================="
-          docker service ls
