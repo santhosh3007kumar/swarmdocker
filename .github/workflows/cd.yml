@@ -66,9 +66,9 @@ jobs:
           aws ecr get-login-password --region us-east-1 | \
             docker login --username AWS --password-stdin $ECR_REGISTRY
 
-          # ----------------------------
-          # PULL IMAGES
-          # ----------------------------
+
+          docker service ls --format "{{.Name}} {{.Image}}" > /tmp/prev_version.txt
+
           docker pull $ECR_REGISTRY/swarmtaskfbackend:$IMAGE_TAG
           docker pull $ECR_REGISTRY/swarmtaskfrontend:$IMAGE_TAG
 
@@ -155,74 +155,18 @@ jobs:
             sleep 10
           done
 
-          echo "DEPLOY STATUS: $SUCCESS"
 
-          # Export result for approval job
+          echo "=============================="
+          echo "DEPLOY STATUS: $SUCCESS"
+          echo "=============================="
+
+          # IMPORTANT: control GitHub job status
           if [ "$SUCCESS" = "true" ]; then
-            echo "status=success" >> $GITHUB_OUTPUT
+            echo "HEALTH CHECK PASSED"
+            exit 0
           else
-            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "HEALTH CHECK FAILED"
+            exit 1
           fi
 
-
-  # ----------------------------
-  # APPROVAL GATE (GitHub UI)
-  # ----------------------------
-  name: Manual Rollback - Swarm (TL Control)
-
-on:
-  workflow_dispatch:
-
-jobs:
-  rollback:
-    runs-on: ubuntu-latest
-
-    steps:
-
-    # ----------------------------
-    # AWS LOGIN (OIDC)
-    # ----------------------------
-    - name: Configure AWS OIDC
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/myoidcrole
-        aws-region: us-east-1
-
-    # ----------------------------
-    # ROLLBACK EXECUTION
-    # ----------------------------
-    - name: Manual Rollback
-      uses: appleboy/ssh-action@v1.0.3
-      with:
-        host: ${{ secrets.SERVER_IP }}
-        username: ubuntu
-        key: ${{ secrets.SSH_PRIVATE_KEY }}
-
-        script: |
-          STACK="foodapp"
-
-          echo "=============================="
-          echo "MANUAL ROLLBACK STARTED BY TL"
-          echo "=============================="
-
-          # Get currently running images (last stable version)
-          BACKEND_IMAGE=$(docker service inspect \
-            --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' \
-            ${STACK}_foodapp_backend)
-
-          FRONTEND_IMAGE=$(docker service inspect \
-            --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' \
-            ${STACK}_foodapp_frontend)
-
-          NGINX_IMAGE=$(docker service inspect \
-            --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' \
-            ${STACK}_foodapp_nginx)
-
-          echo "Reverting to previous stable state..."
-
-          docker service update --image $BACKEND_IMAGE ${STACK}_foodapp_backend
-          docker service update --image $FRONTEND_IMAGE ${STACK}_foodapp_frontend
-          docker service update --image $NGINX_IMAGE ${STACK}_foodapp_nginx
-
-          echo "ROLLBACK COMPLETED SUCCESSFULLY"
-          docker service ls
+          

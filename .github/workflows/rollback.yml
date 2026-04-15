@@ -1,48 +1,21 @@
-name: Rollback Swarm Service
+name: Manual Rollback - Swarm (TL Control)
 
 on:
   workflow_dispatch:
-    inputs:
-      confirm:
-        description: "Type YES to confirm FULL rollback"
-        required: true
-
-permissions:
-  id-token: write
-  contents: read
 
 jobs:
   rollback:
     runs-on: ubuntu-latest
 
-    # ✅ Correct place for approval
-    environment: production
-
     steps:
 
-    # ----------------------------
-    # CONFIRMATION CHECK
-    # ----------------------------
-    - name: Validate confirmation
-      run: |
-        if [ "${{ github.event.inputs.confirm }}" != "YES" ]; then
-          echo "❌ Rollback cancelled — confirmation not provided"
-          exit 1
-        fi
-
-    # ----------------------------
-    # AWS LOGIN
-    # ----------------------------
     - name: Configure AWS OIDC
       uses: aws-actions/configure-aws-credentials@v4
       with:
         role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/myoidcrole
         aws-region: us-east-1
 
-    # ----------------------------
-    # FULL STACK ROLLBACK
-    # ----------------------------
-    - name: Rollback full application
+    - name: Execute Rollback
       uses: appleboy/ssh-action@v1.0.3
       with:
         host: ${{ secrets.SERVER_IP }}
@@ -50,30 +23,20 @@ jobs:
         key: ${{ secrets.SSH_PRIVATE_KEY }}
 
         script: |
-          set -e
-
           STACK="foodapp"
 
-          echo "=============================="
-          echo "FULL ROLLBACK TRIGGERED"
-          echo "=============================="
+          echo "ROLLBACK STARTED"
 
-          docker service rollback ${STACK}_foodapp_backend
-          docker service rollback ${STACK}_foodapp_frontend
-          docker service rollback ${STACK}_foodapp_nginx
+          # 🔥 Read previous version file
+          cat /tmp/prev_version.txt
 
-          echo "Waiting for rollback..."
-          sleep 30
+          BACKEND_IMAGE=$(grep backend /tmp/prev_version.txt | awk '{print $2}')
+          FRONTEND_IMAGE=$(grep frontend /tmp/prev_version.txt | awk '{print $2}')
 
+          echo "Rolling back to previous version..."
+
+          docker service update --image $BACKEND_IMAGE ${STACK}_foodapp_backend
+          docker service update --image $FRONTEND_IMAGE ${STACK}_foodapp_frontend
+
+          echo "ROLLBACK DONE"
           docker service ls
-
-    # ----------------------------
-    # SUCCESS / FAILURE
-    # ----------------------------
-    - name: Success
-      if: success()
-      run: echo "✅ Rollback completed"
-
-    - name: Failure
-      if: failure()
-      run: echo "❌ Rollback failed"
