@@ -17,7 +17,7 @@ jobs:
     steps:
 
     # ----------------------------
-    # AWS OIDC LOGIN
+    # AWS LOGIN (OIDC)
     # ----------------------------
     - name: Configure AWS OIDC
       uses: aws-actions/configure-aws-credentials@v4
@@ -33,9 +33,10 @@ jobs:
       uses: aws-actions/amazon-ecr-login@v2
 
     # ----------------------------
-    # DEPLOY TO EC2 (SWARM)
+    # DEPLOY TO SWARM EC2
     # ----------------------------
     - name: Deploy to Swarm
+      id: deploy
       uses: appleboy/ssh-action@v1.0.3
       with:
         host: ${{ secrets.SERVER_IP }}
@@ -43,7 +44,7 @@ jobs:
         key: ${{ secrets.SSH_PRIVATE_KEY }}
 
         script: |
-          set +e   # ✅ allow script to continue even if health fails
+          set +e
 
           ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
           IMAGE_TAG="${{ github.event.workflow_run.head_sha }}"
@@ -51,48 +52,42 @@ jobs:
 
           echo "=============================="
           echo "STARTING SWARM DEPLOY"
-          echo "IMAGE_TAG : $IMAGE_TAG"
-          echo "ECR       : $ECR_REGISTRY"
+          echo "IMAGE_TAG: $IMAGE_TAG"
           echo "=============================="
 
-          # ----------------------------
-          # PULL LATEST REPO
-          # ----------------------------
           cd ~/swarmdocker
           git fetch --all
           git reset --hard origin/main
           git clean -fd
 
           # ----------------------------
-          # ECR LOGIN ON EC2
+          # ECR LOGIN
           # ----------------------------
-          echo "ECR LOGIN"
           aws ecr get-login-password --region us-east-1 | \
             docker login --username AWS --password-stdin $ECR_REGISTRY
 
           # ----------------------------
-          # PULL NEW IMAGES
+          # PULL IMAGES
           # ----------------------------
-          echo "PULLING NEW IMAGES"
           docker pull $ECR_REGISTRY/swarmtaskfbackend:$IMAGE_TAG
           docker pull $ECR_REGISTRY/swarmtaskfrontend:$IMAGE_TAG
 
           # ----------------------------
-          # RECREATE NGINX CONFIG
+          # REMOVE OLD STACK SAFELY
           # ----------------------------
-          echo "RECREATING NGINX CONFIG"
           docker stack rm $STACK || true
           echo "Waiting for stack removal..."
-          sleep 20
+          sleep 25
 
-          docker config rm ${STACK}_nginx_conf 2>/dev/null || true
-          docker config rm nginx_conf           2>/dev/null || true
+          # ----------------------------
+          # CREATE NGINX CONFIG
+          # ----------------------------
+          docker config rm nginx_conf 2>/dev/null || true
           docker config create nginx_conf ./nginx.conf
 
           # ----------------------------
           # DEPLOY STACK
           # ----------------------------
-          echo "DEPLOYING STACK"
           IMAGE_TAG=$IMAGE_TAG \
             docker stack deploy \
               -c docker-compose.yml \
@@ -100,7 +95,7 @@ jobs:
               --with-registry-auth
 
           # ----------------------------
-          # WAIT FOR SERVICES
+          # WAIT FUNCTION
           # ----------------------------
           wait_for_service() {
             SERVICE=$1
@@ -111,17 +106,18 @@ jobs:
               RUNNING=$(docker service ls \
                 --filter "name=${STACK}_${SERVICE}" \
                 --format "{{.Replicas}}" | cut -d'/' -f1)
+
               DESIRED=$(docker service ls \
                 --filter "name=${STACK}_${SERVICE}" \
                 --format "{{.Replicas}}" | cut -d'/' -f2)
 
               if [ "$RUNNING" = "$DESIRED" ] && [ "$RUNNING" != "0" ]; then
-                echo "${SERVICE} ready ($RUNNING/$DESIRED)"
+                echo "$SERVICE READY ($RUNNING/$DESIRED)"
                 break
               fi
 
               if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
-                echo "Timeout waiting for $SERVICE"
+                echo "TIMEOUT: $SERVICE"
                 break
               fi
 
@@ -134,14 +130,12 @@ jobs:
           wait_for_service "foodapp_frontend"
           wait_for_service "foodapp_nginx"
 
-          echo "Waiting extra 20s..."
-          sleep 20
+          echo "WAITING EXTRA STABILIZATION..."
+          sleep 15
 
           # ----------------------------
-          # HEALTH CHECK (INFO ONLY)
+          # HEALTH CHECK
           # ----------------------------
-          echo "RUNNING HEALTH CHECKS"
-
           SUCCESS=false
 
           for i in $(seq 1 12); do
@@ -149,7 +143,7 @@ jobs:
             FRONTEND_OK=false
 
             curl -f -s http://127.0.0.1/api/health > /dev/null && BACKEND_OK=true
-            curl -f -s http://127.0.0.1/           > /dev/null && FRONTEND_OK=true
+            curl -f -s http://127.0.0.1/ > /dev/null && FRONTEND_OK=true
 
             echo "Attempt $i → backend:$BACKEND_OK frontend:$FRONTEND_OK"
 
@@ -160,52 +154,75 @@ jobs:
 
             sleep 10
           done
-          
+
+          echo "DEPLOY STATUS: $SUCCESS"
+
+          # Export result for approval job
+          if [ "$SUCCESS" = "true" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+          fi
+
+
+  # ----------------------------
+  # APPROVAL GATE (GitHub UI)
+  # ----------------------------
+  name: Manual Rollback - Swarm (TL Control)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+
+    steps:
+
+    # ----------------------------
+    # AWS LOGIN (OIDC)
+    # ----------------------------
+    - name: Configure AWS OIDC
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/myoidcrole
+        aws-region: us-east-1
+
+    # ----------------------------
+    # ROLLBACK EXECUTION
+    # ----------------------------
+    - name: Manual Rollback
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.SERVER_IP }}
+        username: ubuntu
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+        script: |
+          STACK="foodapp"
 
           echo "=============================="
-            echo "DEPLOYMENT COMPLETED"
-            echo "Health Status: $SUCCESS"
-            echo "Waiting for manual decision"
-            echo "=============================="
+          echo "MANUAL ROLLBACK STARTED BY TL"
+          echo "=============================="
 
-            docker service ls
+          # Get currently running images (last stable version)
+          BACKEND_IMAGE=$(docker service inspect \
+            --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' \
+            ${STACK}_foodapp_backend)
 
-  # ✅ APPROVAL JOB (SEPARATE)
-  approval:
-    needs: deploy
-    runs-on: ubuntu-latest
-    environment: production
+          FRONTEND_IMAGE=$(docker service inspect \
+            --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' \
+            ${STACK}_foodapp_frontend)
 
-    steps:
-      - run: echo "Approve = rollback | Reject = keep deployment"
+          NGINX_IMAGE=$(docker service inspect \
+            --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' \
+            ${STACK}_foodapp_nginx)
 
-  # ✅ ROLLBACK JOB
-  rollback:
-    needs: approval
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Configure AWS OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/myoidcrole
-          aws-region: us-east-1
+          echo "Reverting to previous stable state..."
 
-      - name: Rollback
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SERVER_IP }}
-          username: ubuntu
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          docker service update --image $BACKEND_IMAGE ${STACK}_foodapp_backend
+          docker service update --image $FRONTEND_IMAGE ${STACK}_foodapp_frontend
+          docker service update --image $NGINX_IMAGE ${STACK}_foodapp_nginx
 
-          script: |
-            STACK="foodapp"
-
-            echo "ROLLBACK STARTED"
-
-            docker service rollback ${STACK}_foodapp_backend
-            docker service rollback ${STACK}_foodapp_frontend
-            docker service rollback ${STACK}_foodapp_nginx
-
-            sleep 30
-            docker service ls
+          echo "ROLLBACK COMPLETED SUCCESSFULLY"
+          docker service ls
