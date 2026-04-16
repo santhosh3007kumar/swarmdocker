@@ -91,7 +91,7 @@ jobs:
           echo "HEALTH CHECK FAILED"
           exit 1
 
-            rollback:
+  rollback:
     needs: deploy
     if: ${{ needs.deploy.result == 'failure' }}
     runs-on: ubuntu-latest
