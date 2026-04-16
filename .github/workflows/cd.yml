@@ -10,32 +10,30 @@ permissions:
   contents: read
 
 jobs:
+
+# ============================
+# DEPLOY JOB
+# ============================
   deploy:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
 
+    environment:
+      name: production   # 👈 THIS CREATES APPROVAL STEP
+
     steps:
 
-    # ----------------------------
-    # AWS LOGIN (OIDC)
-    # ----------------------------
     - name: Configure AWS OIDC
       uses: aws-actions/configure-aws-credentials@v4
       with:
         role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/myoidcrole
         aws-region: us-east-1
 
-    # ----------------------------
-    # ECR LOGIN
-    # ----------------------------
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
-    # ----------------------------
-    # DEPLOY TO SWARM EC2
-    # ----------------------------
-    - name: Deploy to Swarm
+    - name: Deploy to EC2 Swarm
       id: deploy
       uses: appleboy/ssh-action@v1.0.3
       with:
@@ -44,136 +42,81 @@ jobs:
         key: ${{ secrets.SSH_PRIVATE_KEY }}
 
         script: |
-          set -euo pipefail
+          set -e
+          STACK="foodapp"
 
           ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
           IMAGE_TAG="${{ github.event.workflow_run.head_sha }}"
-          STACK="foodapp"
-
-          echo "=============================="
-          echo "STARTING SWARM DEPLOY"
-          echo "IMAGE_TAG: $IMAGE_TAG"
-          echo "=============================="
 
           cd ~/swarmdocker
           git fetch --all
           git reset --hard origin/main
-          git clean -fd
 
-          # ----------------------------
-          # SAVE PREVIOUS VERSION (IMPORTANT FIX)
-          # ----------------------------
-          echo "Saving previous running images..."
-
+          # SAVE OLD VERSION (for rollback)
           echo "backend $(docker service inspect foodapp_foodapp_backend --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')" > /tmp/prev_version.txt
-
           echo "frontend $(docker service inspect foodapp_foodapp_frontend --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')" >> /tmp/prev_version.txt
-
           echo "nginx $(docker service inspect foodapp_foodapp_nginx --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')" >> /tmp/prev_version.txt
 
-          cat /tmp/prev_version.txt
-
-          # ----------------------------
-          # ECR LOGIN
-          # ----------------------------
+          # LOGIN ECR
           aws ecr get-login-password --region us-east-1 | \
             docker login --username AWS --password-stdin $ECR_REGISTRY
 
-          # ----------------------------
-          # PULL IMAGES
-          # ----------------------------
+          # PULL NEW IMAGE
           docker pull $ECR_REGISTRY/swarmtaskfbackend:$IMAGE_TAG
           docker pull $ECR_REGISTRY/swarmtaskfrontend:$IMAGE_TAG
 
-          # ----------------------------
-          # REMOVE OLD STACK
-          # ----------------------------
-          docker stack rm $STACK || true
-          sleep 25
+          # DEPLOY
+          IMAGE_TAG=$IMAGE_TAG docker stack deploy \
+            -c docker-compose.yml \
+            $STACK \
+            --with-registry-auth
 
-          # ----------------------------
-          # CREATE NGINX CONFIG
-          # ----------------------------
-          docker config rm nginx_conf 2>/dev/null || true
-          docker config create nginx_conf ./nginx.conf
+          sleep 20
 
-          # ----------------------------
-          # DEPLOY STACK
-          # ----------------------------
-          IMAGE_TAG=$IMAGE_TAG \
-            docker stack deploy \
-              -c docker-compose.yml \
-              $STACK \
-              --with-registry-auth
-
-          # ----------------------------
-          # WAIT FUNCTION
-          # ----------------------------
-          wait_for_service() {
-            SERVICE=$1
-            TIMEOUT=120
-            ELAPSED=0
-
-            while true; do
-              RUNNING=$(docker service ls \
-                --filter "name=${STACK}_${SERVICE}" \
-                --format "{{.Replicas}}" | cut -d'/' -f1)
-
-              DESIRED=$(docker service ls \
-                --filter "name=${STACK}_${SERVICE}" \
-                --format "{{.Replicas}}" | cut -d'/' -f2)
-
-              if [ "$RUNNING" = "$DESIRED" ] && [ "$RUNNING" != "0" ]; then
-                echo "$SERVICE READY ($RUNNING/$DESIRED)"
-                break
-              fi
-
-              if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
-                echo "TIMEOUT: $SERVICE"
-                break
-              fi
-
-              sleep 5
-              ELAPSED=$((ELAPSED + 5))
-            done
-          }
-
-          wait_for_service "foodapp_backend"
-          wait_for_service "foodapp_frontend"
-          wait_for_service "foodapp_nginx"
-
-          sleep 15
-
-          # ----------------------------
           # HEALTH CHECK
-          # ----------------------------
-          SUCCESS=false
-
           for i in $(seq 1 12); do
-            BACKEND_OK=false
-            FRONTEND_OK=false
+            curl -f -s http://127.0.0.1/api/health && BACKEND=true || BACKEND=false
+            curl -f -s http://127.0.0.1/ && FRONTEND=true || FRONTEND=false
 
-            curl -f -s http://127.0.0.1/api/health > /dev/null && BACKEND_OK=true
-            curl -f -s http://127.0.0.1/ > /dev/null && FRONTEND_OK=true
+            echo "Attempt $i → backend:$BACKEND frontend:$FRONTEND"
 
-            echo "Attempt $i → backend:$BACKEND_OK frontend:$FRONTEND_OK"
-
-            if [ "$BACKEND_OK" = "true" ] && [ "$FRONTEND_OK" = "true" ]; then
-              SUCCESS=true
-              break
+            if [ "$BACKEND" = "true" ] && [ "$FRONTEND" = "true" ]; then
+              echo "HEALTH CHECK PASSED"
+              exit 0
             fi
 
             sleep 10
           done
 
-          echo "=============================="
-          echo "DEPLOY STATUS: $SUCCESS"
-          echo "=============================="
+          echo "HEALTH CHECK FAILED"
+          exit 1
 
-          if [ "$SUCCESS" = "true" ]; then
-            echo "HEALTH CHECK PASSED"
-            exit 0
-          else
-            echo "HEALTH CHECK FAILED"
-            exit 1
-          fi
+            rollback:
+    needs: deploy
+    if: ${{ needs.deploy.result == 'failure' }}
+    runs-on: ubuntu-latest
+
+    steps:
+
+    - name: Execute Rollback
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.SERVER_IP }}
+        username: ubuntu
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+        script: |
+          set -e
+          STACK="foodapp"
+
+          echo "ROLLBACK STARTED"
+
+          BACKEND_IMAGE=$(grep backend /tmp/prev_version.txt | awk '{print $2}')
+          FRONTEND_IMAGE=$(grep frontend /tmp/prev_version.txt | awk '{print $2}')
+          NGINX_IMAGE=$(grep nginx /tmp/prev_version.txt | awk '{print $2}')
+
+          docker service update --image $BACKEND_IMAGE ${STACK}_foodapp_backend
+          docker service update --image $FRONTEND_IMAGE ${STACK}_foodapp_frontend
+          docker service update --image $NGINX_IMAGE ${STACK}_foodapp_nginx
+
+          echo "ROLLBACK DONE"
