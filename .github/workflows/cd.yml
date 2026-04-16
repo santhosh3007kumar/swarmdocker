@@ -18,6 +18,9 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
 
+    environment:
+      name: production
+
     steps:
 
     - name: Configure AWS OIDC
@@ -30,7 +33,7 @@ jobs:
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Deploy to EC2 Swarm
+    - name: Deploy to Swarm
       id: deploy
       uses: appleboy/ssh-action@v1.0.3
       with:
@@ -40,40 +43,26 @@ jobs:
 
         script: |
           set -e
-          STACK="foodapp"
 
           ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
           IMAGE_TAG="${{ github.event.workflow_run.head_sha }}"
+          STACK="foodapp"
 
           cd ~/swarmdocker
           git fetch --all
           git reset --hard origin/main
+          git clean -fd
 
-          # SAVE OLD VERSION (for rollback)
+          echo "Saving previous versions on EC2..."
           echo "backend $(docker service inspect foodapp_foodapp_backend --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')" > /tmp/prev_version.txt
           echo "frontend $(docker service inspect foodapp_foodapp_frontend --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')" >> /tmp/prev_version.txt
-          echo "nginx $(docker service inspect foodapp_foodapp_nginx --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')" >> /tmp/prev_version.txt
-
-          # LOGIN ECR
+          
           aws ecr get-login-password --region us-east-1 | \
             docker login --username AWS --password-stdin $ECR_REGISTRY
 
-          # PULL NEW IMAGE
           docker pull $ECR_REGISTRY/swarmtaskfbackend:$IMAGE_TAG
           docker pull $ECR_REGISTRY/swarmtaskfrontend:$IMAGE_TAG
 
-          echo "RECREATING NGINX CONFIG"
-          docker stack rm $STACK || true
-          echo "Waiting for stack to fully remove..."
-          sleep 20
-
-          docker config rm ${STACK}_nginx_conf 2>/dev/null || true
-          docker config rm nginx_conf           2>/dev/null || true
-          docker config create nginx_conf ./nginx.conf
-          echo "nginx_conf created ✓"
-
-
-          # DEPLOY
           IMAGE_TAG=$IMAGE_TAG docker stack deploy \
             -c docker-compose.yml \
             $STACK \
@@ -81,46 +70,54 @@ jobs:
 
           sleep 20
 
-          # HEALTH CHECK
+          SUCCESS=false
+
           for i in $(seq 1 12); do
             curl -f -s http://127.0.0.1/api/health && BACKEND=true || BACKEND=false
             curl -f -s http://127.0.0.1/ && FRONTEND=true || FRONTEND=false
 
             echo "Attempt $i → backend:$BACKEND frontend:$FRONTEND"
 
-            if [ "$BACKEND" = "true" ] && [ "$FRONTEND" = "true" ]; then
-              echo "HEALTH CHECK PASSED"
-              exit 0
-            fi
+           if [ "$BACKEND" = "true" ] && [ "$FRONTEND" = "true" ]; then
+            echo "HEALTH CHECK PASSED"
 
-            sleep 10
-          done
+          # CLEANUP HERE ✅
+            echo "Cleaning old images..."
 
+            docker images --format "{{.Repository}}:{{.Tag}}" | grep swarmtask | sort -u > /tmp/all_images.txt
+
+            CURRENT_BACKEND=$ECR_REGISTRY/swarmtaskfbackend:$IMAGE_TAG
+            CURRENT_FRONTEND=$ECR_REGISTRY/swarmtaskfrontend:$IMAGE_TAG
+
+            PREV_BACKEND=$(grep "^backend " /tmp/prev_version.txt | awk '{print $2}')
+            PREV_FRONTEND=$(grep "^frontend " /tmp/prev_version.txt | awk '{print $2}')
+
+            for img in $(cat /tmp/all_images.txt); do
+              if [[ "$img" != "$CURRENT_BACKEND" && "$img" != "$CURRENT_FRONTEND" && "$img" != "$PREV_BACKEND" && "$img" != "$PREV_FRONTEND" ]]; then
+                echo "Removing $img"
+                docker rmi -f $img || true
+              fi
+            done
+
+            exit 0
+          fi
           echo "HEALTH CHECK FAILED"
           exit 1
 
-  approval:
+# ============================
+# ROLLBACK JOB
+# ============================
+  rollback:
     needs: deploy
+    if: ${{ needs.deploy.result == 'failure' || github.event.review.state == 'rejected' }}
     runs-on: ubuntu-latest
 
     environment:
-      name: production  
+      name: production
 
     steps:
-      - name: Waiting for user approval
-        run: echo "User must approve or reject deployment"
 
-
-  # ============================
-# 3. AUTO ROLLBACK IF REJECTED
-# ============================
-  rollback:
-    needs: approval
-    if: ${{ failure() }}   # 👈 runs when user clicks REJECT
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Rollback on EC2
+    - name: Execute Rollback on EC2
       uses: appleboy/ssh-action@v1.0.3
       with:
         host: ${{ secrets.SERVER_IP }}
@@ -131,14 +128,15 @@ jobs:
           set -e
           STACK="foodapp"
 
-          echo "❌ ROLLBACK STARTED"
+          echo "ROLLBACK STARTED"
 
           BACKEND_IMAGE=$(grep backend /tmp/prev_version.txt | awk '{print $2}')
           FRONTEND_IMAGE=$(grep frontend /tmp/prev_version.txt | awk '{print $2}')
-          NGINX_IMAGE=$(grep nginx /tmp/prev_version.txt | awk '{print $2}')
+          
 
           docker service update --image $BACKEND_IMAGE ${STACK}_foodapp_backend
           docker service update --image $FRONTEND_IMAGE ${STACK}_foodapp_frontend
-          docker service update --image $NGINX_IMAGE ${STACK}_foodapp_nginx
+          
 
-          echo "✅ Rollback completed"      
+          echo "ROLLBACK DONE"
+          docker service ls
