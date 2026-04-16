@@ -18,9 +18,6 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
 
-    environment:
-      name: production   # 👈 THIS CREATES APPROVAL STEP
-
     steps:
 
     - name: Configure AWS OIDC
@@ -91,14 +88,28 @@ jobs:
           echo "HEALTH CHECK FAILED"
           exit 1
 
-  rollback:
+  approval:
     needs: deploy
-    if: ${{ needs.deploy.result == 'failure' }}
+    runs-on: ubuntu-latest
+
+    environment:
+      name: production  
+
+    steps:
+      - name: Waiting for user approval
+        run: echo "User must approve or reject deployment"
+
+
+  # ============================
+# 3. AUTO ROLLBACK IF REJECTED
+# ============================
+  rollback:
+    needs: approval
+    if: ${{ failure() }}   # 👈 runs when user clicks REJECT
     runs-on: ubuntu-latest
 
     steps:
-
-    - name: Execute Rollback
+    - name: Rollback on EC2
       uses: appleboy/ssh-action@v1.0.3
       with:
         host: ${{ secrets.SERVER_IP }}
@@ -109,7 +120,7 @@ jobs:
           set -e
           STACK="foodapp"
 
-          echo "ROLLBACK STARTED"
+          echo "❌ ROLLBACK STARTED"
 
           BACKEND_IMAGE=$(grep backend /tmp/prev_version.txt | awk '{print $2}')
           FRONTEND_IMAGE=$(grep frontend /tmp/prev_version.txt | awk '{print $2}')
@@ -119,4 +130,4 @@ jobs:
           docker service update --image $FRONTEND_IMAGE ${STACK}_foodapp_frontend
           docker service update --image $NGINX_IMAGE ${STACK}_foodapp_nginx
 
-          echo "ROLLBACK DONE"
+          echo "✅ Rollback completed"      
