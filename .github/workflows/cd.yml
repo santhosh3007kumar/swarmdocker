@@ -66,12 +66,7 @@ jobs:
           echo "Waiting for stack to fully remove..."
           sleep 20
 
-          docker config rm ${STACK}_nginx_conf 2>/dev/null || true
-          docker config rm nginx_conf           2>/dev/null || true
-          docker config create nginx_conf ./nginx.conf
-          echo "nginx_conf created ✓"
-
-
+      
           IMAGE_TAG=$IMAGE_TAG docker stack deploy \
             -c docker-compose.yml \
             $STACK \
