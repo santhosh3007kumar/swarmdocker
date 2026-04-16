@@ -62,6 +62,17 @@ jobs:
           docker pull $ECR_REGISTRY/swarmtaskfbackend:$IMAGE_TAG
           docker pull $ECR_REGISTRY/swarmtaskfrontend:$IMAGE_TAG
 
+          echo "RECREATING NGINX CONFIG"
+          docker stack rm $STACK || true
+          echo "Waiting for stack to fully remove..."
+          sleep 20
+
+          docker config rm ${STACK}_nginx_conf 2>/dev/null || true
+          docker config rm nginx_conf           2>/dev/null || true
+          docker config create nginx_conf ./nginx.conf
+          echo "nginx_conf created ✓"
+
+
           # DEPLOY
           IMAGE_TAG=$IMAGE_TAG docker stack deploy \
             -c docker-compose.yml \
