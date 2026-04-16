@@ -18,7 +18,6 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
 
-  
     steps:
 
     - name: Configure AWS OIDC
@@ -32,7 +31,6 @@ jobs:
       uses: aws-actions/amazon-ecr-login@v2
 
     - name: Deploy to Swarm
-      id: deploy
       uses: appleboy/ssh-action@v1.0.3
       with:
         host: ${{ secrets.SERVER_IP }}
@@ -51,22 +49,28 @@ jobs:
           git reset --hard origin/main
           git clean -fd
 
-          echo "Saving previous versions on EC2..."
-          echo "backend $(docker service inspect foodapp_foodapp_backend --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')" > /tmp/prev_version.txt
-          echo "frontend $(docker service inspect foodapp_foodapp_frontend --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')" >> /tmp/prev_version.txt
-          
+          echo "Saving previous versions..."
+
+          docker service inspect ${STACK}_foodapp_backend >/dev/null 2>&1 && \
+          echo "backend $(docker service inspect ${STACK}_foodapp_backend --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')" > /tmp/prev_version.txt || echo "backend none" > /tmp/prev_version.txt
+
+          docker service inspect ${STACK}_foodapp_frontend >/dev/null 2>&1 && \
+          echo "frontend $(docker service inspect ${STACK}_foodapp_frontend --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')" >> /tmp/prev_version.txt || echo "frontend none" >> /tmp/prev_version.txt
+
+          # ECR LOGIN
           aws ecr get-login-password --region us-east-1 | \
             docker login --username AWS --password-stdin $ECR_REGISTRY
 
+          # PULL IMAGES
           docker pull $ECR_REGISTRY/swarmtaskfbackend:$IMAGE_TAG
           docker pull $ECR_REGISTRY/swarmtaskfrontend:$IMAGE_TAG
 
-          echo "RECREATING NGINX CONFIG"
+          # REMOVE OLD STACK
+          echo "Removing old stack..."
           docker stack rm $STACK || true
-          echo "Waiting for stack to fully remove..."
           sleep 20
 
-      
+          # DEPLOY NEW STACK
           IMAGE_TAG=$IMAGE_TAG docker stack deploy \
             -c docker-compose.yml \
             $STACK \
@@ -74,6 +78,9 @@ jobs:
 
           sleep 20
 
+          # ============================
+          # HEALTH CHECK LOOP
+          # ============================
           SUCCESS=false
 
           for i in $(seq 1 12); do
@@ -82,10 +89,20 @@ jobs:
 
             echo "Attempt $i → backend:$BACKEND frontend:$FRONTEND"
 
-           if [ "$BACKEND" = "true" ] && [ "$FRONTEND" = "true" ]; then
+            if [ "$BACKEND" = "true" ] && [ "$FRONTEND" = "true" ]; then
+              SUCCESS=true
+              break
+            fi
+
+            sleep 10
+          done
+
+          # ============================
+          # RESULT HANDLING
+          # ============================
+          if [ "$SUCCESS" = "true" ]; then
             echo "HEALTH CHECK PASSED"
 
-          # CLEANUP HERE ✅
             echo "Cleaning old images..."
 
             docker images --format "{{.Repository}}:{{.Tag}}" | grep swarmtask | sort -u > /tmp/all_images.txt
@@ -104,20 +121,19 @@ jobs:
             done
 
             exit 0
+          else
+            echo "HEALTH CHECK FAILED"
+            exit 1
           fi
-          echo "HEALTH CHECK FAILED"
-          exit 1
+
 
 # ============================
 # ROLLBACK JOB
 # ============================
   rollback:
     needs: deploy
-    if: ${{ needs.deploy.result == 'failure' || github.event.review.state == 'rejected' }}
+    if: ${{ needs.deploy.result == 'failure' }}
     runs-on: ubuntu-latest
-
-    environment:
-      name: production
 
     steps:
 
@@ -136,11 +152,9 @@ jobs:
 
           BACKEND_IMAGE=$(grep backend /tmp/prev_version.txt | awk '{print $2}')
           FRONTEND_IMAGE=$(grep frontend /tmp/prev_version.txt | awk '{print $2}')
-          
 
           docker service update --image $BACKEND_IMAGE ${STACK}_foodapp_backend
           docker service update --image $FRONTEND_IMAGE ${STACK}_foodapp_frontend
-          
 
           echo "ROLLBACK DONE"
           docker service ls
